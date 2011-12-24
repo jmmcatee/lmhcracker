@@ -8,10 +8,14 @@ import (
 	"crypto/des"
 	"runtime"
 	"time"
+	"os"
+	"runtime/pprof"
+	"log"
 )
 
 
 var numParallelOp = flag.Int("p", 2, "Number of parallel processes to run")
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 //var boolGenHash   = flag.Bool("g", "false", "Generate LM Hash with string input")
 
 var lmhashConstant = []byte("KGS!@#$%")
@@ -39,9 +43,31 @@ type guessStatus struct {
 	Guess     []byte
 }
 
+type guessInfo struct {
+        Position int
+        PosID int
+        GuessRange []byte
+        KnownHashes [][]byte
+        Ch chan guessStatus
+        CurrentSeed []byte
+        GuessStartTime *time.Time
+        Guesses int64
+}
+
+
 
 func main() {
 	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
 	runtime.GOMAXPROCS(*numParallelOp+1)
 
 	unKnownLMHashes := make([][]byte, len(flag.Args()))
@@ -59,7 +85,8 @@ func main() {
 	guessSplit := divideWork()
 
 	for i, value := range guessSplit {
-		go guessHashes(i, unKnownLMHashes, value, statusCh)
+		params := guessInfo{6, i, value, unKnownLMHashes, statusCh, []byte{value[0],0x00,0x00,0x00,0x00,0x00,0x00,0x00}, time.LocalTime(), 0}
+		go guessHashes(&params)
 	}
 
 	var foundKeys = 0
@@ -97,54 +124,41 @@ func divideWork() [][]byte {
 	return guessSplit
 }
 
-func guessHashes(posID int, knownHashes [][]byte, guessRange []byte, ch chan guessStatus) {
-	var guesses int64 = 0
-	currentSeed  := []byte{guessRange[0],0x00,0x00,0x00,0x00,0x00,0x00,0x00}
-	guessHash    := make([]byte, 8)
-	var guessStartTime = time.LocalTime()
-
-	for _, value := range posChars {
-	 currentSeed[6] = value
-	 for _, value := range posChars {
-	  currentSeed[5] = value
-	  if (currentSeed[5]==0x00 && currentSeed[6]!=0x00) {continue}
-	  for _, value := range posChars {
-	   currentSeed[4] = value
-	   if (currentSeed[4]==0x00 && currentSeed[5]!=0x00) {continue}
-	   for _, value := range posChars {
-	    ch <- guessStatus{posID, guesses, time.Seconds()-guessStartTime.Seconds(), false, currentSeed}
-	    currentSeed[3] = value
-	    if (currentSeed[3]==0x00 && currentSeed[4]!=0x00) {continue}
-	    for _, value := range posChars {
-	     currentSeed[2] = value
-	     if (currentSeed[2]==0x00 && currentSeed[3]!=0x00) {continue}
-	     for _, value := range posChars {
-	      currentSeed[1] = value
-	      if (currentSeed[1]==0x00 && currentSeed[2]!=0x00) {continue}
-	      for _, value := range guessRange {
-		currentSeed[0] = value
-		guessHash = createLMHash(currentSeed)
-		for _, value := range knownHashes {
-		  if bytes.Compare(guessHash, value)==0 {
-		    // The append keeps the data in the channel from being
-		    // changed once it is mapped on the other side. By 
-		    // creating a seperate array a new untouched space is used.
-		    ch <- guessStatus{posID, guesses, time.Seconds()-guessStartTime.Seconds(), true,
-					[]byte{currentSeed[0],
-						currentSeed[1], currentSeed[2], currentSeed[3],
-						currentSeed[4], currentSeed[5], currentSeed[6], 0x00}}
-		    fmt.Printf("::FOUND KEY: %s (%X) at (%d seconds)\n",
-				currentSeed, currentSeed, time.Seconds()-guessStartTime.Seconds())
-		 }
+func guessHashes(params *guessInfo) (paramsOut *guessInfo) {
+	for _, currentChar := range posChars {
+		params.CurrentSeed[params.Position] = currentChar
+		if params.Position > 0 {
+			params.Position = params.Position-1
+			params = guessHashes(params)
 		}
-		guesses++
-	      }
-	     }
-	    }
-	   }
-	  }
-	 }
+		if params.Position == 3 {
+			params.Ch <- guessStatus{params.PosID, params.Guesses, time.Seconds()-params.GuessStartTime.Seconds(), false, params.CurrentSeed}
+		}
+
+		if params.Position == 0 {
+			for _, currentGuess := range params.GuessRange {
+				params.CurrentSeed[params.Position] = currentGuess
+				var guessHash = createLMHash(params.CurrentSeed)
+				for _, currentCheckHash := range params.KnownHashes {
+					if bytes.Compare(guessHash, currentCheckHash)==0 {
+						// The append keeps the data in the channel from being
+						// changed once it is mapped on the other side. By 
+						// creating a seperate array a new untouched space is used.
+						params.Ch <- guessStatus{params.PosID, params.Guesses, time.Seconds()-params.GuessStartTime.Seconds(), true,
+							[]byte{params.CurrentSeed[0], params.CurrentSeed[1], params.CurrentSeed[2], params.CurrentSeed[3],
+								params.CurrentSeed[4], params.CurrentSeed[5], params.CurrentSeed[6], 0x00}}
+						fmt.Printf("::FOUND KEY: %s (%X) at (%d seconds) process:%d\n",
+							params.CurrentSeed, params.CurrentSeed,
+							time.Seconds()-params.GuessStartTime.Seconds(), params.PosID)
+					}
+				}
+				params.Guesses++
+			}
+			break
+		}
 	}
+	params.Position++
+	return params
 }
 
 func createLMHash(passHalve []byte) (hashHalve []byte) {
