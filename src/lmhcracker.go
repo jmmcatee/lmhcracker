@@ -15,7 +15,8 @@ import (
 
 
 var numParallelOp = flag.Int("p", 2, "Number of parallel processes to run")
-var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+var cpuprofile = flag.String("cpuprofile", "", "Write cpu profile to file")
+var runBenchmark = flag.Bool("b", false, "Run program brenchmark")
 
 var lmhashConstant = []byte("KGS!@#$%")
 var posChars = []byte{0x00 /* NULL  */,
@@ -33,6 +34,7 @@ var posChars = []byte{0x00 /* NULL  */,
 	0x3B /* ; */, 0x3C /* < */, 0x3D /* = */, 0x3E /* > */, 0x5B /* [ */,
 	0x5C /* \ */, 0x5D /* ] */, 0x5E /* ^ */, 0x5F /* _ */, 0x60 /* ` */,
 	0x7B /* { */, 0x7C /* | */, 0x7D /* } */, 0x7E /* ~ */}
+var benchmarkInput = make([][]byte, 1)
 
 type guessStatus struct {
 	PosID     int
@@ -76,25 +78,69 @@ func main() {
 	// Set the number of threads using the input parameter given
 	runtime.GOMAXPROCS(*numParallelOp+1)
 
+	var arraySize = 0
+	if *runBenchmark {
+		// ABCD
+		benchmarkInput[0] = []byte{0xE1, 0x65, 0xF0, 0x19, 0x2E, 0xF8,
+									0x5E, 0xBB, 0xAA, 0xD3, 0xB4, 0x35, 
+									0xB5, 0x14, 0x04, 0xEE}
+		// 1234
+		benchmarkInput = append(benchmarkInput, []byte{0xB7, 0x57, 0xBF, 0x5C, 0x0D, 0x87,
+														0x77, 0x2F, 0xAA, 0xD3, 0xB4, 0x35,
+														0xB5, 0x14, 0x04, 0xEE})
+		// 9999
+		benchmarkInput = append(benchmarkInput, []byte{0xA5, 0x93, 0x8F, 0x23, 0xD5, 0x47,
+														0x19, 0xA0, 0xAA, 0xD3, 0xB4, 0x35,
+														0xB5, 0x14, 0x04, 0xEE})
+		// AAAAA
+		benchmarkInput = append(benchmarkInput, []byte{0xA8, 0x0F, 0x6E, 0x6A, 0x87, 0xBA,
+														0x6A, 0xC2, 0xAA, 0xD3, 0xB4, 0x35,
+														0xB5, 0x14, 0x04, 0xEE})
+		// EDCBA
+		benchmarkInput = append(benchmarkInput, []byte{0x40, 0x97, 0xB2, 0x61, 0xB6, 0xA1,
+														0x34, 0xCA, 0xAA, 0xD3, 0xB4, 0x35,
+														0xB5, 0x14, 0x04, 0xEE})
+		// 1234F
+		benchmarkInput = append(benchmarkInput, []byte{0x0E, 0xBB, 0x05, 0xDE, 0xE2, 0xD1,
+															0xc0, 0xb9, 0xAA, 0xD3, 0xB4, 0x35,
+															0xB5, 0x14, 0x04, 0xEE})
+
+		arraySize = len(benchmarkInput) * 2
+	} else {
+		arraySize = len(flag.Args()) * 2
+	}
+
 	unKnownLMHashes := make([][]byte, 2)
-	crackedPassword := make([][]byte, len(flag.Args())*2)
+	crackedPassword := make([][]byte, arraySize)
 	statusCh := make(chan guessStatus)
 
 	fmt.Printf("Beginning LM Hash Brute Force Guessing... (%s)\n", progStartTime.String())
 	fmt.Printf("- Looking for: \n")
 
 	// Get input Hashes
-	inputHashes := make([][]byte, len(flag.Args())*2)
-	inputToCrackedMap := make([]int, len(flag.Args())*2)
+	inputHashes := make([][]byte, arraySize)
+	inputToCrackedMap := make([]int, arraySize)
 	_ihCounter := 0
-	for _, value := range flag.Args() {
-		input, _ := hex.DecodeString(value)
-		inputHashes[_ihCounter] = input[:8]
-		_ihCounter++
-		inputHashes[_ihCounter] = input[8:]
-		_ihCounter++
+
+	if *runBenchmark {
+		for _, value := range benchmarkInput {
+			inputHashes[_ihCounter] = value[:8]
+			_ihCounter++
+			inputHashes[_ihCounter] = value[8:]
+			_ihCounter++
+		}
+	} else {
+		for _, value := range flag.Args() {
+			input, _ := hex.DecodeString(value)
+			inputHashes[_ihCounter] = input[:8]
+			_ihCounter++
+			inputHashes[_ihCounter] = input[8:]
+			_ihCounter++
+		}
 	}
+
 	// add to unknownLMHashes array
+	var indexCounter = 0
 	for i, input := range inputHashes {
 		// check if has is already in
 		check := false
@@ -113,7 +159,8 @@ func main() {
 				unKnownLMHashes = append(unKnownLMHashes, input)
 			}
 
-			inputToCrackedMap[i] = i
+			inputToCrackedMap[i] = indexCounter
+			indexCounter++
 		} else {
 			inputToCrackedMap[i] = foundIndex
 		}
@@ -147,7 +194,7 @@ func main() {
 			foundKeys++
 		} else {
 			if stat.RunTime!=0{
-				fmt.Printf("- Process %d: Guesses:%d (%d/s) Last Guess:%s\n", stat.PosID,
+				fmt.Printf("- Process %d: Guesses:%d (%d/s) Last Guess:%X\n", stat.PosID,
 				stat.Guesses, stat.Guesses/(stat.RunTime), stat.Guess)
 			}
 		}
