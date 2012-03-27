@@ -16,7 +16,6 @@ import (
 
 var numParallelOp = flag.Int("p", 2, "Number of parallel processes to run")
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
-//var boolGenHash   = flag.Bool("g", "false", "Generate LM Hash with string input")
 
 var lmhashConstant = []byte("KGS!@#$%")
 var posChars = []byte{0x00 /* NULL  */,
@@ -34,13 +33,14 @@ var posChars = []byte{0x00 /* NULL  */,
 	0x3B /* ; */, 0x3C /* < */, 0x3D /* = */, 0x3E /* > */, 0x5B /* [ */,
 	0x5C /* \ */, 0x5D /* ] */, 0x5E /* ^ */, 0x5F /* _ */, 0x60 /* ` */,
 	0x7B /* { */, 0x7C /* | */, 0x7D /* } */, 0x7E /* ~ */}
-var progStartTime = time.LocalTime()
+
 type guessStatus struct {
 	PosID     int
 	Guesses   int64
 	RunTime	  int64
 	FoundHash bool
 	Guess     []byte
+	HashCrackedIndex int
 }
 
 type guessInfo struct {
@@ -57,8 +57,13 @@ type guessInfo struct {
 
 
 func main() {
+	// Start program timer
+	progStartTime := time.LocalTime()
+
+	// Parse flag inputs
 	flag.Parse()
 
+	// Code used to profile program performance
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
@@ -68,24 +73,69 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
+	// Set the number of threads using the input parameter given
 	runtime.GOMAXPROCS(*numParallelOp+1)
 
-	unKnownLMHashes := make([][]byte, len(flag.Args()))
-	crackedPassword := make([][]byte, len(flag.Args()))
+	unKnownLMHashes := make([][]byte, 2)
+	crackedPassword := make([][]byte, len(flag.Args())*2)
 	statusCh := make(chan guessStatus)
 
 	fmt.Printf("Beginning LM Hash Brute Force Guessing... (%s)\n", progStartTime.String())
 	fmt.Printf("- Looking for: \n")
-	for i, value := range flag.Args() {
-		unKnownLMHashes[i], _ = hex.DecodeString(value)
-		fmt.Printf("  - %X\n", unKnownLMHashes[i])
+
+	// Get input Hashes
+	inputHashes := make([][]byte, len(flag.Args())*2)
+	inputToCrackedMap := make([]int, len(flag.Args())*2)
+	_ihCounter := 0
+	for _, value := range flag.Args() {
+		input, _ := hex.DecodeString(value)
+		inputHashes[_ihCounter] = input[:8]
+		_ihCounter++
+		inputHashes[_ihCounter] = input[8:]
+		_ihCounter++
 	}
+	// add to unknownLMHashes array
+	for i, input := range inputHashes {
+		// check if has is already in
+		check := false
+		foundIndex := 0
+		for j, unknown := range unKnownLMHashes {
+			if bytes.Compare(input, unknown) == 0 {
+				check = true
+				foundIndex = j
+			}
+		}
+		
+		if !check {
+			if i < 2 {
+				unKnownLMHashes[i] = input
+			} else {
+				unKnownLMHashes = append(unKnownLMHashes, input)
+			}
+
+			inputToCrackedMap[i] = i
+		} else {
+			inputToCrackedMap[i] = foundIndex
+		}
+	}
+	// Print hashes to find
+	for _, value := range unKnownLMHashes {
+		fmt.Printf("  - %X\n", value)
+	}
+
 	fmt.Printf("- Guessing Split into %d processes\n", *numParallelOp)
 
 	guessSplit := divideWork()
 
 	for i, value := range guessSplit {
-		params := guessInfo{6, i, value, unKnownLMHashes, statusCh, []byte{value[0],0x00,0x00,0x00,0x00,0x00,0x00,0x00}, time.LocalTime(), 0}
+		params := guessInfo{	6,
+								i,
+								value,
+								unKnownLMHashes,
+								statusCh,
+								[]byte{value[0],0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+								time.LocalTime(),
+								0													}
 		go guessHashes(&params)
 	}
 
@@ -93,7 +143,7 @@ func main() {
 	for {
 		stat := <-statusCh
 		if stat.FoundHash {
-			crackedPassword[foundKeys] = stat.Guess
+			crackedPassword[stat.HashCrackedIndex] = stat.Guess
 			foundKeys++
 		} else {
 			if stat.RunTime!=0{
@@ -102,16 +152,24 @@ func main() {
 			}
 		}
 
-		if foundKeys==len(flag.Args()) {
+		if foundKeys == len(unKnownLMHashes) {
 			break
 		}
 	}
 
 	time.Sleep(10)
 	fmt.Printf("\n\nFound Keys (Took %d seconds)\n", time.Seconds()-progStartTime.Seconds())
-	for _, plain := range crackedPassword {
-		fmt.Printf("- %X (%s)\n", plain, plain)
+
+	// Print hashes in correct order with inputToCrackedMap
+	for i, _ := range inputHashes {
+		if i % 2 == 1 && i != 0 {
+			fmt.Printf("- Given: %X%X \n", inputHashes[i-1], inputHashes[i])
+			_first  := crackedPassword[inputToCrackedMap[i-1]]
+			_second := crackedPassword[inputToCrackedMap[i]]
+			fmt.Printf("  Cracked: %X%X (%s%s)\n", _first, _second, _first, _second)
+		}
 	}
+
 }
 
 func divideWork() [][]byte {
@@ -131,22 +189,37 @@ func guessHashes(params *guessInfo) (paramsOut *guessInfo) {
 			params.Position = params.Position-1
 			params = guessHashes(params)
 		}
-		if params.Position == 3 {
-			params.Ch <- guessStatus{params.PosID, params.Guesses, time.Seconds()-params.GuessStartTime.Seconds(), false, params.CurrentSeed}
+		if params.Position == 4 {
+			params.Ch <- guessStatus{	params.PosID,
+										params.Guesses,
+										time.Seconds()-params.GuessStartTime.Seconds(),
+										false,
+										params.CurrentSeed,
+										0												}
 		}
 
 		if params.Position == 0 {
 			for _, currentGuess := range params.GuessRange {
 				params.CurrentSeed[params.Position] = currentGuess
 				var guessHash = createLMHash(params.CurrentSeed)
-				for _, currentCheckHash := range params.KnownHashes {
+				for i, currentCheckHash := range params.KnownHashes {
 					if bytes.Compare(guessHash, currentCheckHash)==0 {
-						// The append keeps the data in the channel from being
+						// The []byte call keeps the data in the channel from being
 						// changed once it is mapped on the other side. By 
 						// creating a seperate array a new untouched space is used.
-						params.Ch <- guessStatus{params.PosID, params.Guesses, time.Seconds()-params.GuessStartTime.Seconds(), true,
-							[]byte{params.CurrentSeed[0], params.CurrentSeed[1], params.CurrentSeed[2], params.CurrentSeed[3],
-								params.CurrentSeed[4], params.CurrentSeed[5], params.CurrentSeed[6], 0x00}}
+						params.Ch <- guessStatus{	params.PosID,
+													params.Guesses,
+													time.Seconds()-params.GuessStartTime.Seconds(),
+													true,
+													[]byte{	params.CurrentSeed[0],
+															params.CurrentSeed[1],
+															params.CurrentSeed[2],
+															params.CurrentSeed[3],
+															params.CurrentSeed[4],
+															params.CurrentSeed[5],
+															params.CurrentSeed[6],
+															0x00					},
+													i												}
 						fmt.Printf("::FOUND KEY: %s (%X) at (%d seconds) process:%d\n",
 							params.CurrentSeed, params.CurrentSeed,
 							time.Seconds()-params.GuessStartTime.Seconds(), params.PosID)
@@ -154,6 +227,9 @@ func guessHashes(params *guessInfo) (paramsOut *guessInfo) {
 				}
 				params.Guesses++
 			}
+			/* Because the 0 index has split guess characters for parallel work break once loop 
+				is done to allow the 1 index to increment to the next full posChars character.
+			 */
 			break
 		}
 	}
